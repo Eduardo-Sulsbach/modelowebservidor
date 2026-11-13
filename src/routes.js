@@ -1,10 +1,5 @@
 import { randomUUID } from 'node:crypto';
-
-// Arrays usados como banco de dados em memória.
-const clientes = [];
-const categorias = [];
-const fornecedores = [];
-const produtos = [];
+import { db } from './database.js';
 
 function responderJson(response, status, dados) {
   response.writeHead(status, {
@@ -21,9 +16,17 @@ function textoObrigatorio(valor) {
   return typeof valor === 'string' && valor.trim().length > 0;
 }
 
-// Cria as rotas GET, POST, PUT e DELETE para cada array.
-function criarRotasCrud({ caminho, lista, validar, preparar, antesDeExcluir }) {
-  return (request, response, pathname) => {
+// Registra GET, POST, PUT e DELETE para uma tabela SQLite.
+function criarRotasCrud({
+  caminho,
+  tabela,
+  colunas,
+  validar,
+  preparar,
+  formatar = (registro) => registro,
+  antesDeExcluir,
+}) {
+  return async (request, response, pathname) => {
     if (pathname !== caminho && !pathname.startsWith(`${caminho}/`)) {
       return false;
     }
@@ -31,13 +34,14 @@ function criarRotasCrud({ caminho, lista, validar, preparar, antesDeExcluir }) {
     const sufixo = pathname.slice(caminho.length);
     const id = sufixo ? sufixo.slice(1) : null;
 
-    // GET /recurso — lista todos os registros.
+    // GET /recurso — lista todos.
     if (id === null && request.method === 'GET') {
-      responderJson(response, 200, lista);
+      const registros = await db.all(`SELECT * FROM ${tabela}`);
+      responderJson(response, 200, registros.map(formatar));
       return true;
     }
 
-    // POST /recurso — valida e cadastra um registro.
+    // POST /recurso — valida e cadastra.
     if (id === null && request.method === 'POST') {
       if (!ehObjeto(request.body)) {
         responderJson(response, 400, {
@@ -46,39 +50,55 @@ function criarRotasCrud({ caminho, lista, validar, preparar, antesDeExcluir }) {
         return true;
       }
 
-      const problema = validar(request.body, null);
+      const problema = await validar(request.body, null);
 
       if (problema) {
         responderJson(response, problema.status, { erro: problema.mensagem });
         return true;
       }
 
-      const registro = {
-        id: randomUUID(),
-        ...preparar(request.body),
-      };
+      const novoId = randomUUID();
+      const valores = preparar(request.body);
+      const marcadores = ['?', ...colunas.map(() => '?')].join(', ');
+      const sql = `
+        INSERT INTO ${tabela} (id, ${colunas.join(', ')})
+        VALUES (${marcadores})
+      `;
+      const parametros = [
+        novoId,
+        ...colunas.map((coluna) => valores[coluna]),
+      ];
 
-      lista.push(registro);
-      responderJson(response, 201, registro);
+      await db.run(sql, parametros);
+
+      const registro = await db.get(
+        `SELECT * FROM ${tabela} WHERE id = ?`,
+        [novoId],
+      );
+
+      responderJson(response, 201, formatar(registro));
       return true;
     }
 
-    // As outras operações usam um ID: /recurso/:id
+    // GET, PUT e DELETE de um registro usam /recurso/:id.
     if (id === null || id.length === 0 || id.includes('/')) {
       responderJson(response, 404, { erro: 'Rota não encontrada.' });
       return true;
     }
 
-    const indice = lista.findIndex((registro) => registro.id === id);
+    const linha = await db.get(
+      `SELECT * FROM ${tabela} WHERE id = ?`,
+      [id],
+    );
 
-    if (indice === -1) {
+    if (!linha) {
       responderJson(response, 404, { erro: 'Registro não encontrado.' });
       return true;
     }
 
-    const registro = lista[indice];
+    const registro = formatar(linha);
 
-    // GET /recurso/:id — busca um registro.
+    // GET /recurso/:id — consulta um registro.
     if (request.method === 'GET') {
       responderJson(response, 200, registro);
       return true;
@@ -99,34 +119,56 @@ function criarRotasCrud({ caminho, lista, validar, preparar, antesDeExcluir }) {
         id: registro.id,
       };
 
-      const problema = validar(atualizado, registro.id);
+      const problema = await validar(atualizado, registro.id);
 
       if (problema) {
         responderJson(response, problema.status, { erro: problema.mensagem });
         return true;
       }
 
-      Object.assign(registro, preparar(atualizado), { id: registro.id });
-      responderJson(response, 200, registro);
+      const valores = preparar(atualizado);
+      const atribuicoes = colunas
+        .map((coluna) => `${coluna} = ?`)
+        .join(', ');
+      const parametros = [
+        ...colunas.map((coluna) => valores[coluna]),
+        registro.id,
+      ];
+
+      await db.run(
+        `UPDATE ${tabela} SET ${atribuicoes} WHERE id = ?`,
+        parametros,
+      );
+
+      const registroAtualizado = await db.get(
+        `SELECT * FROM ${tabela} WHERE id = ?`,
+        [registro.id],
+      );
+
+      responderJson(response, 200, formatar(registroAtualizado));
       return true;
     }
 
     // DELETE /recurso/:id — remove um registro.
     if (request.method === 'DELETE') {
-      const problema = antesDeExcluir ? antesDeExcluir(registro) : null;
+      const problema = antesDeExcluir
+        ? await antesDeExcluir(registro)
+        : null;
 
       if (problema) {
         responderJson(response, problema.status, { erro: problema.mensagem });
         return true;
       }
 
-      lista.splice(indice, 1);
+      await db.run(`DELETE FROM ${tabela} WHERE id = ?`, [registro.id]);
       response.writeHead(204);
       response.end();
       return true;
     }
 
-    responderJson(response, 405, { erro: 'Método não permitido para esta rota.' });
+    responderJson(response, 405, {
+      erro: 'Método não permitido para esta rota.',
+    });
     return true;
   };
 }
@@ -134,9 +176,10 @@ function criarRotasCrud({ caminho, lista, validar, preparar, antesDeExcluir }) {
 const rotas = [
   criarRotasCrud({
     caminho: '/clientes',
-    lista: clientes,
+    tabela: 'clientes',
+    colunas: ['nome', 'email', 'telefone', 'ativo'],
 
-    validar: (cliente, idAtual) => {
+    validar: async (cliente, idAtual) => {
       if (!textoObrigatorio(cliente.nome)) {
         return { status: 400, mensagem: 'O campo nome é obrigatório.' };
       }
@@ -157,14 +200,21 @@ const rotas = [
       }
 
       const email = cliente.email.trim().toLowerCase();
+      let existente;
 
-      // .some() verifica se o email já está cadastrado.
-      const emailDuplicado = clientes.some(
-        (existente) =>
-          existente.email === email && existente.id !== idAtual,
-      );
+      if (idAtual === null) {
+        existente = await db.get(
+          'SELECT id FROM clientes WHERE email = ? LIMIT 1',
+          [email],
+        );
+      } else {
+        existente = await db.get(
+          'SELECT id FROM clientes WHERE email = ? AND id <> ? LIMIT 1',
+          [email, idAtual],
+        );
+      }
 
-      if (emailDuplicado) {
+      if (existente) {
         return {
           status: 409,
           mensagem: 'Já existe um cliente cadastrado com esse email.',
@@ -178,15 +228,21 @@ const rotas = [
       nome: cliente.nome.trim(),
       email: cliente.email.trim().toLowerCase(),
       telefone: cliente.telefone ? cliente.telefone.trim() : '',
-      ativo: cliente.ativo === undefined ? true : cliente.ativo,
+      ativo: cliente.ativo === undefined ? 1 : Number(cliente.ativo),
+    }),
+
+    formatar: (cliente) => ({
+      ...cliente,
+      ativo: Boolean(cliente.ativo),
     }),
   }),
 
   criarRotasCrud({
     caminho: '/categorias',
-    lista: categorias,
+    tabela: 'categorias',
+    colunas: ['nome', 'descricao'],
 
-    validar: (categoria) => {
+    validar: async (categoria) => {
       if (!textoObrigatorio(categoria.nome)) {
         return { status: 400, mensagem: 'O campo nome é obrigatório.' };
       }
@@ -206,12 +262,13 @@ const rotas = [
       descricao: categoria.descricao ? categoria.descricao.trim() : '',
     }),
 
-    antesDeExcluir: (categoria) => {
-      const categoriaEmUso = produtos.some(
-        (produto) => produto.categoriaId === categoria.id,
+    antesDeExcluir: async (categoria) => {
+      const produto = await db.get(
+        'SELECT id FROM produtos WHERE categoriaId = ? LIMIT 1',
+        [categoria.id],
       );
 
-      if (categoriaEmUso) {
+      if (produto) {
         return {
           status: 409,
           mensagem: 'Não é possível excluir uma categoria que possui produtos.',
@@ -224,9 +281,10 @@ const rotas = [
 
   criarRotasCrud({
     caminho: '/fornecedores',
-    lista: fornecedores,
+    tabela: 'fornecedores',
+    colunas: ['razaoSocial', 'cnpj', 'contato'],
 
-    validar: (fornecedor) => {
+    validar: async (fornecedor) => {
       if (!textoObrigatorio(fornecedor.razaoSocial)) {
         return { status: 400, mensagem: 'O campo razaoSocial é obrigatório.' };
       }
@@ -260,9 +318,10 @@ const rotas = [
 
   criarRotasCrud({
     caminho: '/produtos',
-    lista: produtos,
+    tabela: 'produtos',
+    colunas: ['nome', 'preco', 'categoriaId'],
 
-    validar: (produto) => {
+    validar: async (produto) => {
       if (!textoObrigatorio(produto.nome)) {
         return { status: 400, mensagem: 'O campo nome é obrigatório.' };
       }
@@ -282,15 +341,15 @@ const rotas = [
         typeof produto.categoriaId !== 'string' ||
         produto.categoriaId.length === 0
       ) {
-        return { status: 400, mensagem: 'Informe o id da categoria do produto.' };
+        return { status: 400, mensagem: 'Informe o id da categoria.' };
       }
 
-      // A categoria precisa existir no array de categorias.
-      const categoriaExiste = categorias.some(
-        (categoria) => categoria.id === produto.categoriaId,
+      const categoria = await db.get(
+        'SELECT id FROM categorias WHERE id = ?',
+        [produto.categoriaId],
       );
 
-      if (!categoriaExiste) {
+      if (!categoria) {
         return { status: 400, mensagem: 'A categoria informada não existe.' };
       }
 
@@ -305,16 +364,25 @@ const rotas = [
   }),
 ];
 
-// O server.js original importa e chama esta função.
-export const manipuladorDeRotas = (request, response) => {
-  const pathname =
-    new URL(request.url, 'http://localhost').pathname.replace(/\/+$/, '') || '/';
+export async function manipuladorDeRotas(request, response) {
+  try {
+    const pathname =
+      new URL(request.url, 'http://localhost').pathname.replace(/\/+$/, '') || '/';
 
-  for (const tratarRota of rotas) {
-    if (tratarRota(request, response, pathname)) {
-      return;
+    for (const tratarRota of rotas) {
+      if (await tratarRota(request, response, pathname)) {
+        return;
+      }
+    }
+
+    responderJson(response, 404, { erro: 'Rota ou método não encontrado.' });
+  } catch (erro) {
+    console.error('Erro ao acessar o SQLite:', erro);
+
+    if (!response.headersSent) {
+      responderJson(response, 500, {
+        erro: 'Erro interno ao acessar o banco de dados.',
+      });
     }
   }
-
-  responderJson(response, 404, { erro: 'Rota ou método não encontrado.' });
-};
+}

@@ -1,17 +1,25 @@
-// server.js
-import http from 'http';
+import http from 'node:http';
 import { manipuladorDeRotas } from './routes.js';
 import { json } from './middlewares/json.js';
 
-const server = http.createServer(async (request, response) => {
-  // 1. Passa pelo Middleware para formatar o JSON
-  await json(request, response);
+const porta = Number(process.env.PORT) || 3333;
 
-  // 2. Encaminha para as rotas processarem a lógica
-  manipuladorDeRotas(request, response);
+const server = http.createServer(async (request, response) => {
+  try {
+    await json(request, response);
+    await manipuladorDeRotas(request, response);
+  } catch (erro) {
+    console.error('Erro no servidor:', erro);
+
+    if (!response.headersSent) {
+      response.writeHead(500, {
+        'Content-Type': 'application/json; charset=utf-8',
+      });
+      response.end(JSON.stringify({ erro: 'Erro interno no servidor.' }));
+    }
+  }
 });
 
-// Inicializa o servidor
-server.listen(3333, () => {
-  console.log('🚀 API de Produtos rodando em http://localhost:3333');
+server.listen(porta, () => {
+  console.log(`API rodando em http://localhost:${porta}`);
 });
